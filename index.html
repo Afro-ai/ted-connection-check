@@ -6,32 +6,61 @@
 <meta name="robots" content="noindex, nofollow">
 <title>Connection Check — Ted.Talks.DZ</title>
 <!--
-  Algeria reachability diagnostic.
+  Algeria reachability diagnostic — v2 (2026-08-22 overhaul).
   See docs/agent_handoff_2026-08-18_cloudflare-ip-blocking.md
 
-  PURPOSE: turn "the site doesn't work" into a per-host yes/no table. Each app in
-  the platform is on a different host; some are Cloudflare-proxied Workers, one
-  (writing.*) is on Vercel. If the Cloudflare-proxied hosts fail while the Vercel
-  host succeeds from the same device at the same moment, that is direct evidence
-  of ISP-level blocking of Cloudflare's shared proxy IPs rather than any app bug.
+  PURPOSE: turn "the site doesn't work" into something actually diagnosable —
+  not just "some hosts failed" but WHICH ISP/ASN, HOW MANY rounds failed
+  (not just one snapshot), and a machine-parseable report Ted can aggregate
+  across multiple student reports over time.
+
+  WHAT v1 COULD NOT TELL YOU (why this exists):
+  - Which ISP/carrier the student is on — the #1 missing piece. Without it,
+    "some students report this, some don't" can never become "Djezzy users
+    are blocked, Mobilis users aren't."
+  - Whether a single run was a fluke — one 20s snapshot can't distinguish
+    "always blocked" from "blocked right now" from "just flaky."
+  - google.com/wikipedia.org as controls are large anycast operators that
+    could themselves be regionally affected — weak as an independent control.
+  - The report was a loose text blob, not aggregable across students.
 
   DESIGN CONSTRAINTS (deliberate — do not "simplify" these away):
-  - ZERO external dependencies. If this page needed a CDN it could not load on
-    exactly the broken networks it is meant to measure.
+  - ZERO external script/style/font dependencies for the page itself. If this
+    page needed a CDN it could not load on exactly the broken networks it is
+    meant to measure. The IP-lookup calls (see below) are the ONE exception,
+    and are explicitly optional/best-effort — their failure never blocks or
+    corrupts the reachability test itself.
   - Probes use fetch(mode:'no-cors') + a cache-busting query param. A no-cors
     response is opaque (status unreadable), so we can only distinguish
     "resolved and connected" from "failed/timed out" — which is precisely the
-    signal we want, and it avoids needing CORS headers on every app.
-  - A timeout is a RESULT, not an error: an ISP-level block usually manifests as
-    a hang, not a refusal. Hence the explicit per-probe deadline.
-  - Self-hosted on bankruptthebc.online, which is itself Cloudflare-proxied. If a
-    student cannot open this page at all, that is itself a finding — tell them to
-    report "couldn't even open the check page".
+    signal we want, and it avoids needing CORS headers on every Ted app.
+  - A timeout is a RESULT, not an error: an ISP-level block usually manifests
+    as a hang, not a refusal. Hence the explicit per-probe deadline.
+  - Self-hosted on bankruptthebc.online, which is itself Cloudflare-proxied.
+    If a student cannot open this page at all, that is itself a finding —
+    tell them to report "couldn't even open the check page" (they should
+    still be able to open the GitHub Pages mirror in that case).
+
+  ISP/ASN LOOKUP — why this specific pair, in this order:
+  - Primary: ipinfo.io/json — HTTPS, CORS "*", NOT Cloudflare-fronted
+    (verified via `dig`: resolves to Google infra, not a Cloudflare IP range).
+    Keeping the metadata lookup off Cloudflare too means a Cloudflare-wide
+    block can't silently blank out the one field that would explain WHY.
+  - Fallback: ipwho.is — HTTPS, CORS "*", also works, used only if ipinfo.io
+    fails for any reason (own outage, unrelated to what we're testing).
+  - Both were live-verified (2026-08-22) to return isp/org/asn/region fields
+    from a real Algerian IP. ipapi.co was tried and rejected — it returns a
+    Cloudflare bot-challenge page (HTTP 403) instead of JSON, unusably
+    unreliable for this purpose.
+  - This lookup is METADATA about the connection, never a reachability probe
+    itself — its failure is recorded as "unknown" and does not change the
+    verdict logic, which depends only on the TARGETS probes below.
 -->
 <style>
   :root {
     --void: #0f1115; --paper: #f7f5f1; --line: #2a2f3a;
     --ok: #2f9e63; --fail: #d1495b; --pending: #8a8f98; --gold: #c9a87c;
+    --warn: #c98a3c;
   }
   * { box-sizing: border-box; }
   body {
@@ -41,14 +70,26 @@
   }
   main { max-width: 640px; margin: 0 auto; }
   h1 { font-size: 1.35rem; margin: 0 0 4px; }
-  .sub { color: var(--pending); font-size: .9rem; margin: 0 0 24px; }
+  .sub { color: var(--pending); font-size: .9rem; margin: 0 0 20px; }
+  .meta {
+    font-size: .78rem; color: var(--pending); margin: 0 0 20px;
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+  }
+  .meta b { color: var(--paper); }
+  .meta .row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  label { display: block; font-size: .85rem; color: var(--pending); margin: 0 0 16px; }
+  select {
+    width: 100%; margin-top: 6px; background: #171a21; color: var(--paper);
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+    font: 15px system-ui, sans-serif;
+  }
   button {
     background: var(--gold); color: #1a1205; border: 0; border-radius: 8px;
     font: 600 1rem/1 system-ui, sans-serif; padding: 14px 20px; cursor: pointer;
     width: 100%; margin-bottom: 20px;
   }
   button[disabled] { opacity: .55; cursor: default; }
-  ul { list-style: none; padding: 0; margin: 0 0 24px; }
+  ul { list-style: none; padding: 0; margin: 0 0 12px; }
   li {
     display: flex; align-items: center; gap: 12px;
     padding: 12px 0; border-bottom: 1px solid var(--line);
@@ -58,16 +99,26 @@
   .host { flex: 1; min-width: 0; }
   .host b { display: block; font-weight: 600; font-size: .95rem; word-break: break-all; }
   .host span { color: var(--pending); font-size: .8rem; }
-  .verdict { font-size: .85rem; white-space: nowrap; color: var(--pending); }
+  .verdict-cell { font-size: .8rem; white-space: nowrap; color: var(--pending); text-align: right; }
+  #round-progress {
+    font-size: .82rem; color: var(--pending); margin: 4px 0 16px; display: none;
+  }
+  #round-progress.show { display: block; }
   #summary {
     border: 1px solid var(--line); border-left: 3px solid var(--gold);
     border-radius: 6px; padding: 16px; font-size: .9rem; display: none;
   }
   #summary.show { display: block; }
+  #summary.strong { border-left-color: var(--fail); }
+  #summary.inconclusive { border-left-color: var(--warn); }
   textarea {
-    width: 100%; margin-top: 12px; min-height: 130px; background: #171a21;
+    width: 100%; margin-top: 12px; min-height: 170px; background: #171a21;
     color: var(--paper); border: 1px solid var(--line); border-radius: 6px;
-    padding: 10px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+    padding: 10px; font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  }
+  .copybtn {
+    background: #171a21; color: var(--paper); border: 1px solid var(--line);
+    margin-top: 8px; margin-bottom: 0; padding: 10px;
   }
 </style>
 </head>
@@ -75,16 +126,28 @@
 <main>
   <h1>Connection Check</h1>
   <p class="sub">This tests which parts of the platform your internet connection can reach.
-     It takes about 20 seconds. <strong>Please run it with your VPN turned OFF.</strong></p>
+     <strong>Please run it with your VPN turned OFF.</strong></p>
+
+  <div class="meta" id="isp-meta">Looking up your connection info…</div>
+
+  <label>How many rounds to run?
+    <select id="rounds">
+      <option value="1">1 round (~20 seconds — quick check)</option>
+      <option value="3" selected>3 rounds (~1 minute — recommended, catches intermittent blocks)</option>
+      <option value="5">5 rounds (~2 minutes — most thorough)</option>
+    </select>
+  </label>
 
   <button id="run">Start the check</button>
+  <div id="round-progress"></div>
   <ul id="list"></ul>
 
   <div id="summary">
     <div id="verdict"></div>
     <p style="margin:12px 0 0;color:var(--pending);font-size:.85rem">
-      Copy the text below and send it back to Ted on WhatsApp.</p>
+      Copy the report below and send it back to Ted on WhatsApp.</p>
     <textarea id="report" readonly></textarea>
+    <button class="copybtn" id="copy">Copy report to clipboard</button>
   </div>
 </main>
 
@@ -92,38 +155,104 @@
 (function () {
   'use strict';
 
-  // Each entry names WHY it is in the list, so the result table is interpretable
-  // without cross-referencing the handoff doc.
+  // ---- Targets ---------------------------------------------------------
   // `cf: true`  = one of Ted's Cloudflare-proxied apps (the things under test).
-  // `control: true` = a NON-Cloudflare host used to prove the internet works
-  //   even when Ted's apps do not. These are deliberately third-party: Ted has
-  //   no live non-Cloudflare host of his own to point at (writing.bankruptthebc
-  //   .online was retired — do not re-add it as a control, it is dead).
-  //   Two independent controls are used so one third party being unreachable
-  //   for its own reasons cannot fake a "the internet is down" verdict.
+  // `control: true` = an INDEPENDENT host used to prove the internet works
+  //   even when Ted's apps do not. Ted has no live non-Cloudflare host of his
+  //   own to point at (writing.bankruptthebc.online was retired — dead, do
+  //   not re-add). Three independent, differently-operated controls are used
+  //   (not just Google/Wikipedia, which share large anycast footprints that
+  //   could themselves be regionally affected) so one of them being down for
+  //   its own reasons can't fake a "the internet is down" verdict.
   var TARGETS = [
     { url: 'https://bankruptthebc.online/robots.txt',    label: 'bankruptthebc.online',           note: 'Main site — Cloudflare Pages (proxied)', cf: true  },
     { url: 'https://api.bankruptthebc.online/',          label: 'api.bankruptthebc.online',       note: 'CBT exam backend — Cloudflare Worker',   cf: true  },
     { url: 'https://listening.bankruptthebc.online/',    label: 'listening.bankruptthebc.online', note: 'Listening Lab — Cloudflare Worker',      cf: true  },
     { url: 'https://reading.bankruptthebc.online/',      label: 'reading.bankruptthebc.online',   note: 'Reading Lab — Cloudflare Worker',        cf: true  },
     { url: 'https://essay.bankruptthebc.online/',        label: 'essay.bankruptthebc.online',     note: 'Essay Visualizer — Cloudflare Worker',   cf: true  },
-    { url: 'https://www.google.com/generate_204',        label: 'google.com',                     note: 'Baseline — not Cloudflare',              control: true },
-    { url: 'https://www.wikipedia.org/',                 label: 'wikipedia.org',                  note: 'Baseline — not Cloudflare',              control: true }
+    { url: 'https://www.wikipedia.org/',                 label: 'wikipedia.org',                  note: 'Control — large anycast, not Cloudflare', control: true },
+    { url: 'https://www.bing.com/',                      label: 'bing.com',                       note: 'Control — Microsoft, not Cloudflare',    control: true },
+    { url: 'https://afro-ai.github.io/',                 label: 'github.io',                      note: 'Control — GitHub Pages, not Cloudflare', control: true }
   ];
 
   var TIMEOUT_MS = 8000;
 
-  /**
-   * Probe one host. Resolves to {ok, ms} — never rejects.
-   *
-   * no-cors gives an opaque response: we cannot read the status code, only
-   * whether the connection completed. That is enough here, and it means the
-   * probed apps need no CORS configuration. A timeout counts as a failure
-   * because ISP-level IP blocking typically presents as a hang.
-   */
+  // ---- ISP / ASN metadata (best-effort, never blocks the test) ---------
+  //
+  // Two providers, primary then fallback, both verified live 2026-08-22 to
+  // return isp/org/asn/region from a real Algerian IP with CORS "*". This is
+  // the single biggest diagnostic upgrade over v1: without knowing WHICH ISP
+  // a failing student is on, individual reports can never be aggregated into
+  // "carrier X is blocked, carrier Y isn't."
+  var ispInfo = { status: 'pending' };
+
+  function fetchJson(url, timeoutMs) {
+    var timer;
+    var timeout = new Promise(function (_, reject) {
+      timer = setTimeout(function () { reject(new Error('timeout')); }, timeoutMs);
+    });
+    var req = fetch(url, { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    });
+    return Promise.race([req, timeout]).finally(function () { clearTimeout(timer); });
+  }
+
+  function lookupIsp() {
+    return fetchJson('https://ipinfo.io/json', 6000)
+      .then(function (d) {
+        return {
+          status: 'ok', provider: 'ipinfo.io',
+          ip: d.ip || 'unknown',
+          isp: d.org || 'unknown',                 // ipinfo bundles ASN+org into one "org" string
+          region: [d.city, d.region, d.country].filter(Boolean).join(', ') || 'unknown'
+        };
+      })
+      .catch(function () {
+        return fetchJson('https://ipwho.is/', 6000)
+          .then(function (d) {
+            var c = d.connection || {};
+            return {
+              status: 'ok', provider: 'ipwho.is',
+              ip: d.ip || 'unknown',
+              isp: (c.isp || c.org || 'unknown') + (c.asn ? ' (AS' + c.asn + ')' : ''),
+              region: [d.city, d.region, d.country].filter(Boolean).join(', ') || 'unknown'
+            };
+          })
+          .catch(function () {
+            return { status: 'failed' };
+          });
+      });
+  }
+
+  var ispMetaEl = document.getElementById('isp-meta');
+  lookupIsp().then(function (info) {
+    ispInfo = info;
+    if (info.status === 'ok') {
+      ispMetaEl.innerHTML =
+        '<div class="row"><span>ISP</span><b>' + escapeHtml(info.isp) + '</b></div>' +
+        '<div class="row"><span>Location</span><b>' + escapeHtml(info.region) + '</b></div>';
+    } else {
+      ispMetaEl.textContent = 'Could not detect your ISP info (this does not affect the test below).';
+    }
+  });
+
+  function escapeHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // ---- Reachability probe -----------------------------------------------
+  //
+  // Resolves to {ok, ms, timedOut}. Never rejects. no-cors gives an opaque
+  // response: we cannot read the status code, only whether the connection
+  // completed. That is enough here, and it means the probed apps need no
+  // CORS configuration. A timeout counts as a failure because ISP-level IP
+  // blocking typically presents as a hang, not an immediate refusal.
   function probe(target) {
     var started = Date.now();
-    var url = target.url + (target.url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + started;
+    var url = target.url + (target.url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + started + Math.random().toString(36).slice(2);
     var timer;
 
     var timeout = new Promise(function (resolve) {
@@ -140,79 +269,182 @@
   var listEl = document.getElementById('list');
   var rows = TARGETS.map(function (t) {
     var li = document.createElement('li');
-    li.innerHTML = '<span class="dot"></span><span class="host"><b></b><span></span></span><span class="verdict">waiting</span>';
+    li.innerHTML = '<span class="dot"></span><span class="host"><b></b><span></span></span><span class="verdict-cell">waiting</span>';
     li.querySelector('b').textContent = t.label;
     li.querySelector('.host span').textContent = t.note;
     listEl.appendChild(li);
-    return { dot: li.querySelector('.dot'), verdict: li.querySelector('.verdict') };
+    return { dot: li.querySelector('.dot'), verdict: li.querySelector('.verdict-cell') };
   });
+
+  var progressEl = document.getElementById('round-progress');
 
   document.getElementById('run').addEventListener('click', function () {
     var btn = this;
+    var numRounds = parseInt(document.getElementById('rounds').value, 10) || 1;
     btn.disabled = true;
-    btn.textContent = 'Checking…';
-    document.getElementById('summary').classList.remove('show');
+    document.getElementById('summary').classList.remove('show', 'strong', 'inconclusive');
+    progressEl.classList.add('show');
 
-    var results = [];
-    // Sequential, not parallel: a phone on a degraded network gives much noisier
-    // timings when seven requests contend, and total runtime is still ~20s.
-    var chain = Promise.resolve();
-    TARGETS.forEach(function (t, i) {
-      chain = chain.then(function () {
-        rows[i].verdict.textContent = 'checking…';
-        return probe(t).then(function (r) {
-          results[i] = r;
-          rows[i].dot.className = 'dot ' + (r.ok ? 'ok' : 'fail');
-          rows[i].verdict.textContent = r.ok ? ('OK · ' + r.ms + 'ms')
-                                             : (r.timedOut ? 'TIMED OUT' : 'FAILED');
+    // allRounds[roundIndex][targetIndex] = {ok, ms, timedOut}
+    var allRounds = [];
+
+    function runRound(roundIndex) {
+      progressEl.textContent = 'Round ' + (roundIndex + 1) + ' of ' + numRounds + '…';
+      btn.textContent = 'Checking (round ' + (roundIndex + 1) + '/' + numRounds + ')…';
+
+      var results = [];
+      // Sequential, not parallel: a phone on a degraded network gives much
+      // noisier timings when several requests contend for bandwidth at once.
+      var chain = Promise.resolve();
+      TARGETS.forEach(function (t, i) {
+        chain = chain.then(function () {
+          rows[i].verdict.textContent = 'checking…';
+          return probe(t).then(function (r) {
+            results[i] = r;
+            rows[i].dot.className = 'dot ' + (r.ok ? 'ok' : 'fail');
+            rows[i].verdict.textContent = r.ok ? ('OK · ' + r.ms + 'ms')
+                                               : (r.timedOut ? 'TIMED OUT' : 'FAILED');
+          });
         });
       });
-    });
+      return chain.then(function () {
+        allRounds.push(results);
+        if (roundIndex + 1 < numRounds) return runRound(roundIndex + 1);
+      });
+    }
 
-    chain.then(function () {
+    runRound(0).then(function () {
       btn.disabled = false;
       btn.textContent = 'Run again';
-
-      var cfTotal = 0, cfOk = 0, ctrlOk = 0;
-      TARGETS.forEach(function (t, i) {
-        if (t.cf) { cfTotal++; if (results[i].ok) cfOk++; }
-        if (t.control && results[i].ok) ctrlOk++;
-      });
-
-      // Order matters. The "no Cloudflare host reachable" cases must be decided
-      // BEFORE the partial case, otherwise a run where everything Cloudflare
-      // failed can fall through and be described as "some were reachable".
-      var verdict;
-      if (ctrlOk === 0) {
-        // Without a working control we cannot attribute the failure to
-        // Cloudflare specifically — say so rather than overclaiming.
-        verdict = 'Your internet connection itself looks down or heavily filtered — the baseline sites failed too. This run cannot tell an ISP block apart from a general connection problem; please run it again when other websites are working.';
-      } else if (cfOk === 0) {
-        verdict = 'STRONG SIGNAL: every Cloudflare-hosted app failed while other websites worked from this same device. This matches ISP-level blocking of Cloudflare.';
-      } else if (cfOk < cfTotal) {
-        verdict = 'PARTIAL: some Cloudflare-hosted apps were reachable and others were not — consistent with intermittent/partial blocking.';
-      } else {
-        verdict = 'All hosts reachable right now. If the platform failed earlier, the block is intermittent — please run this again at the exact moment it breaks.';
-      }
-      document.getElementById('verdict').textContent = verdict;
-
-      var lines = [
-        'Ted.Talks.DZ connection check',
-        'When: ' + new Date().toString(),
-        'Timezone: ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown'),
-        'Device: ' + navigator.userAgent,
-        ''
-      ];
-      TARGETS.forEach(function (t, i) {
-        var r = results[i];
-        lines.push((r.ok ? '[OK]   ' : '[FAIL] ') + t.label +
-                   ' — ' + (r.ok ? r.ms + 'ms' : (r.timedOut ? 'timed out' : 'failed')) +
-                   (t.cf ? ' (Cloudflare)' : ' (control, not Cloudflare)'));
-      });
-      lines.push('', 'Verdict: ' + verdict);
-      document.getElementById('report').value = lines.join('\n');
-      document.getElementById('summary').classList.add('show');
+      progressEl.classList.remove('show');
+      finish(allRounds, numRounds);
     });
+  });
+
+  function finish(allRounds, numRounds) {
+    // Per-target: how many of the N rounds succeeded, and average ms when ok.
+    var perTarget = TARGETS.map(function (t, i) {
+      var successes = 0, totalMs = 0, msCount = 0, timeouts = 0, otherFails = 0;
+      allRounds.forEach(function (round) {
+        var r = round[i];
+        if (r.ok) { successes++; totalMs += r.ms; msCount++; }
+        else if (r.timedOut) timeouts++;
+        else otherFails++;
+      });
+      return {
+        target: t, successes: successes, rounds: allRounds.length,
+        avgMs: msCount ? Math.round(totalMs / msCount) : null,
+        timeouts: timeouts, otherFails: otherFails
+      };
+    });
+
+    var cfTargets = perTarget.filter(function (p) { return p.target.cf; });
+    var ctrlTargets = perTarget.filter(function (p) { return p.target.control; });
+
+    // "Reachable at all" per target = succeeded in AT LEAST ONE round.
+    var cfAnyOk = cfTargets.filter(function (p) { return p.successes > 0; }).length;
+    var ctrlAnyOk = ctrlTargets.filter(function (p) { return p.successes > 0; }).length;
+
+    // "Perfectly clean" per target = succeeded in EVERY round. This is a
+    // DIFFERENT, stricter condition than cfAnyOk === cfTargets.length — a
+    // target that failed round 1, succeeded round 2, failed round 3 counts
+    // toward cfAnyOk (it succeeded at least once) but must NOT be reported as
+    // "all reachable," because it is exactly the flaky/intermittent pattern
+    // more rounds exist to catch. Bug found in testing: an earlier version of
+    // this logic only checked cfAnyOk === cfTargets.length for the "all
+    // clear" branch, which is true even when every target flapped between
+    // rounds — it would tell a student with a real intermittent block that
+    // everything was fine.
+    var cfAllPerfect = cfTargets.every(function (p) { return p.successes === allRounds.length; });
+    var cfAnyIntermittent = cfTargets.some(function (p) { return p.successes > 0 && p.successes < allRounds.length; });
+
+    // Consistency signal: did Cloudflare hosts fail in EVERY round while
+    // controls succeeded in EVERY round? That is much stronger evidence than
+    // a single-snapshot failure, and is exactly what more rounds buys us.
+    var cfAllRoundsFailed = cfTargets.every(function (p) { return p.successes === 0; });
+    var ctrlAllRoundsOk = ctrlTargets.every(function (p) { return p.successes === allRounds.length; });
+
+    var summaryEl = document.getElementById('summary');
+    var verdict, cssClass = '';
+
+    // Order matters: "no working control at all" must be decided before the
+    // partial/strong-signal cases, otherwise a run where everything
+    // Cloudflare failed AND controls also failed could be misdescribed.
+    if (ctrlAnyOk === 0) {
+      verdict = 'Your internet connection itself looks down or heavily filtered right now — the independent control sites failed too, across all ' + allRounds.length + ' round(s). This run cannot tell an ISP block on Cloudflare apart from a general connection problem. Please run it again when other websites are working.';
+      cssClass = 'inconclusive';
+    } else if (cfAnyOk === 0 && cfAllRoundsFailed && ctrlAllRoundsOk) {
+      verdict = 'STRONG SIGNAL: every Ted.Talks.DZ app failed in ALL ' + allRounds.length + ' round(s), while every independent control site succeeded in ALL ' + allRounds.length + ' round(s), from the same device. This is consistent with ISP-level blocking specifically affecting Cloudflare-hosted sites.';
+      cssClass = 'strong';
+    } else if (cfAnyOk === 0) {
+      verdict = 'Every Ted.Talks.DZ app failed across all rounds, and at least one control site also failed at some point — still suspicious, but slightly less clean a signal than a fully consistent pattern. Worth investigating.';
+      cssClass = 'strong';
+    } else if (cfAnyOk < cfTargets.length || cfAnyIntermittent) {
+      verdict = 'PARTIAL: some Ted.Talks.DZ apps were unreachable, or results varied between rounds for at least one app — consistent with intermittent or partial blocking rather than a hard block. Check the per-app results below for which one(s) flip.';
+    } else if (cfAllPerfect) {
+      verdict = 'All Ted.Talks.DZ apps reachable in every round, with no flakiness. If the platform failed earlier and not now, the block may be intermittent — running this again at the exact moment it breaks would help.';
+    } else {
+      // Should be unreachable given the branches above, but avoid ever
+      // falling through silently to a blank verdict.
+      verdict = 'Mixed results — see the per-app breakdown below for details.';
+    }
+    document.getElementById('verdict').textContent = verdict;
+    summaryEl.classList.add('show');
+    if (cssClass) summaryEl.classList.add(cssClass);
+
+    // ---- Structured report -------------------------------------------
+    // Kept as plain text (so it pastes cleanly into WhatsApp) but with a
+    // machine-parseable KEY: value shape per section, so multiple student
+    // reports can eventually be aggregated by script rather than read by eye
+    // one at a time.
+    var lines = [
+      'TED.TALKS.DZ CONNECTION CHECK REPORT v2',
+      'time: ' + new Date().toISOString(),
+      'timezone: ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown'),
+      'rounds: ' + allRounds.length,
+      'device: ' + navigator.userAgent,
+      'isp_lookup_status: ' + ispInfo.status,
+    ];
+    if (ispInfo.status === 'ok') {
+      lines.push(
+        'isp_ip: ' + ispInfo.ip,
+        'isp_name: ' + ispInfo.isp,
+        'isp_region: ' + ispInfo.region,
+        'isp_lookup_provider: ' + ispInfo.provider
+      );
+    }
+    lines.push('', 'RESULTS (successes/rounds, avg ms when reachable):');
+    perTarget.forEach(function (p) {
+      var status = p.successes === p.rounds ? 'ALWAYS_OK'
+                 : p.successes === 0 ? 'ALWAYS_FAILED'
+                 : 'INTERMITTENT';
+      lines.push(
+        '[' + status + '] ' + p.target.label +
+        ' — ' + p.successes + '/' + p.rounds + ' rounds ok' +
+        (p.avgMs !== null ? ', avg ' + p.avgMs + 'ms' : '') +
+        (p.timeouts ? ', ' + p.timeouts + ' timeout(s)' : '') +
+        (p.otherFails ? ', ' + p.otherFails + ' other failure(s)' : '') +
+        (p.target.cf ? ' [Ted app, Cloudflare]' : ' [control, not Cloudflare]')
+      );
+    });
+    lines.push('', 'VERDICT: ' + verdict);
+    document.getElementById('report').value = lines.join('\n');
+  }
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var ta = document.getElementById('report');
+    ta.select();
+    ta.setSelectionRange(0, 999999);
+    var btn = this;
+    var restore = btn.textContent;
+    (navigator.clipboard && navigator.clipboard.writeText
+      ? navigator.clipboard.writeText(ta.value)
+      : Promise.reject())
+      .catch(function () { document.execCommand('copy'); })
+      .then(function () {
+        btn.textContent = 'Copied — now paste it to Ted on WhatsApp';
+        setTimeout(function () { btn.textContent = restore; }, 2500);
+      });
   });
 })();
 </script>
