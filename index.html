@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Connection Check — Ted.Talks.DZ</title>
+<!--
+  Algeria reachability diagnostic.
+  See docs/agent_handoff_2026-08-18_cloudflare-ip-blocking.md
+
+  PURPOSE: turn "the site doesn't work" into a per-host yes/no table. Each app in
+  the platform is on a different host; some are Cloudflare-proxied Workers, one
+  (writing.*) is on Vercel. If the Cloudflare-proxied hosts fail while the Vercel
+  host succeeds from the same device at the same moment, that is direct evidence
+  of ISP-level blocking of Cloudflare's shared proxy IPs rather than any app bug.
+
+  DESIGN CONSTRAINTS (deliberate — do not "simplify" these away):
+  - ZERO external dependencies. If this page needed a CDN it could not load on
+    exactly the broken networks it is meant to measure.
+  - Probes use fetch(mode:'no-cors') + a cache-busting query param. A no-cors
+    response is opaque (status unreadable), so we can only distinguish
+    "resolved and connected" from "failed/timed out" — which is precisely the
+    signal we want, and it avoids needing CORS headers on every app.
+  - A timeout is a RESULT, not an error: an ISP-level block usually manifests as
+    a hang, not a refusal. Hence the explicit per-probe deadline.
+  - Self-hosted on bankruptthebc.online, which is itself Cloudflare-proxied. If a
+    student cannot open this page at all, that is itself a finding — tell them to
+    report "couldn't even open the check page".
+-->
+<style>
+  :root {
+    --void: #0f1115; --paper: #f7f5f1; --line: #2a2f3a;
+    --ok: #2f9e63; --fail: #d1495b; --pending: #8a8f98; --gold: #c9a87c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 48px;
+    background: var(--void); color: var(--paper);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 4px; }
+  .sub { color: var(--pending); font-size: .9rem; margin: 0 0 24px; }
+  button {
+    background: var(--gold); color: #1a1205; border: 0; border-radius: 8px;
+    font: 600 1rem/1 system-ui, sans-serif; padding: 14px 20px; cursor: pointer;
+    width: 100%; margin-bottom: 20px;
+  }
+  button[disabled] { opacity: .55; cursor: default; }
+  ul { list-style: none; padding: 0; margin: 0 0 24px; }
+  li {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 0; border-bottom: 1px solid var(--line);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--pending); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.fail { background: var(--fail); }
+  .host { flex: 1; min-width: 0; }
+  .host b { display: block; font-weight: 600; font-size: .95rem; word-break: break-all; }
+  .host span { color: var(--pending); font-size: .8rem; }
+  .verdict { font-size: .85rem; white-space: nowrap; color: var(--pending); }
+  #summary {
+    border: 1px solid var(--line); border-left: 3px solid var(--gold);
+    border-radius: 6px; padding: 16px; font-size: .9rem; display: none;
+  }
+  #summary.show { display: block; }
+  textarea {
+    width: 100%; margin-top: 12px; min-height: 130px; background: #171a21;
+    color: var(--paper); border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Connection Check</h1>
+  <p class="sub">This tests which parts of the platform your internet connection can reach.
+     It takes about 20 seconds. <strong>Please run it with your VPN turned OFF.</strong></p>
+
+  <button id="run">Start the check</button>
+  <ul id="list"></ul>
+
+  <div id="summary">
+    <div id="verdict"></div>
+    <p style="margin:12px 0 0;color:var(--pending);font-size:.85rem">
+      Copy the text below and send it back to Ted on WhatsApp.</p>
+    <textarea id="report" readonly></textarea>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  // Each entry names WHY it is in the list, so the result table is interpretable
+  // without cross-referencing the handoff doc.
+  // `cf: true`  = one of Ted's Cloudflare-proxied apps (the things under test).
+  // `control: true` = a NON-Cloudflare host used to prove the internet works
+  //   even when Ted's apps do not. These are deliberately third-party: Ted has
+  //   no live non-Cloudflare host of his own to point at (writing.bankruptthebc
+  //   .online was retired — do not re-add it as a control, it is dead).
+  //   Two independent controls are used so one third party being unreachable
+  //   for its own reasons cannot fake a "the internet is down" verdict.
+  var TARGETS = [
+    { url: 'https://bankruptthebc.online/robots.txt',    label: 'bankruptthebc.online',           note: 'Main site — Cloudflare Pages (proxied)', cf: true  },
+    { url: 'https://api.bankruptthebc.online/',          label: 'api.bankruptthebc.online',       note: 'CBT exam backend — Cloudflare Worker',   cf: true  },
+    { url: 'https://listening.bankruptthebc.online/',    label: 'listening.bankruptthebc.online', note: 'Listening Lab — Cloudflare Worker',      cf: true  },
+    { url: 'https://reading.bankruptthebc.online/',      label: 'reading.bankruptthebc.online',   note: 'Reading Lab — Cloudflare Worker',        cf: true  },
+    { url: 'https://essay.bankruptthebc.online/',        label: 'essay.bankruptthebc.online',     note: 'Essay Visualizer — Cloudflare Worker',   cf: true  },
+    { url: 'https://www.google.com/generate_204',        label: 'google.com',                     note: 'Baseline — not Cloudflare',              control: true },
+    { url: 'https://www.wikipedia.org/',                 label: 'wikipedia.org',                  note: 'Baseline — not Cloudflare',              control: true }
+  ];
+
+  var TIMEOUT_MS = 8000;
+
+  /**
+   * Probe one host. Resolves to {ok, ms} — never rejects.
+   *
+   * no-cors gives an opaque response: we cannot read the status code, only
+   * whether the connection completed. That is enough here, and it means the
+   * probed apps need no CORS configuration. A timeout counts as a failure
+   * because ISP-level IP blocking typically presents as a hang.
+   */
+  function probe(target) {
+    var started = Date.now();
+    var url = target.url + (target.url.indexOf('?') === -1 ? '?' : '&') + 'cb=' + started;
+    var timer;
+
+    var timeout = new Promise(function (resolve) {
+      timer = setTimeout(function () { resolve({ ok: false, ms: TIMEOUT_MS, timedOut: true }); }, TIMEOUT_MS);
+    });
+
+    var request = fetch(url, { mode: 'no-cors', cache: 'no-store' })
+      .then(function () { return { ok: true, ms: Date.now() - started }; })
+      .catch(function () { return { ok: false, ms: Date.now() - started }; });
+
+    return Promise.race([request, timeout]).then(function (r) { clearTimeout(timer); return r; });
+  }
+
+  var listEl = document.getElementById('list');
+  var rows = TARGETS.map(function (t) {
+    var li = document.createElement('li');
+    li.innerHTML = '<span class="dot"></span><span class="host"><b></b><span></span></span><span class="verdict">waiting</span>';
+    li.querySelector('b').textContent = t.label;
+    li.querySelector('.host span').textContent = t.note;
+    listEl.appendChild(li);
+    return { dot: li.querySelector('.dot'), verdict: li.querySelector('.verdict') };
+  });
+
+  document.getElementById('run').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    document.getElementById('summary').classList.remove('show');
+
+    var results = [];
+    // Sequential, not parallel: a phone on a degraded network gives much noisier
+    // timings when seven requests contend, and total runtime is still ~20s.
+    var chain = Promise.resolve();
+    TARGETS.forEach(function (t, i) {
+      chain = chain.then(function () {
+        rows[i].verdict.textContent = 'checking…';
+        return probe(t).then(function (r) {
+          results[i] = r;
+          rows[i].dot.className = 'dot ' + (r.ok ? 'ok' : 'fail');
+          rows[i].verdict.textContent = r.ok ? ('OK · ' + r.ms + 'ms')
+                                             : (r.timedOut ? 'TIMED OUT' : 'FAILED');
+        });
+      });
+    });
+
+    chain.then(function () {
+      btn.disabled = false;
+      btn.textContent = 'Run again';
+
+      var cfTotal = 0, cfOk = 0, ctrlOk = 0;
+      TARGETS.forEach(function (t, i) {
+        if (t.cf) { cfTotal++; if (results[i].ok) cfOk++; }
+        if (t.control && results[i].ok) ctrlOk++;
+      });
+
+      // Order matters. The "no Cloudflare host reachable" cases must be decided
+      // BEFORE the partial case, otherwise a run where everything Cloudflare
+      // failed can fall through and be described as "some were reachable".
+      var verdict;
+      if (ctrlOk === 0) {
+        // Without a working control we cannot attribute the failure to
+        // Cloudflare specifically — say so rather than overclaiming.
+        verdict = 'Your internet connection itself looks down or heavily filtered — the baseline sites failed too. This run cannot tell an ISP block apart from a general connection problem; please run it again when other websites are working.';
+      } else if (cfOk === 0) {
+        verdict = 'STRONG SIGNAL: every Cloudflare-hosted app failed while other websites worked from this same device. This matches ISP-level blocking of Cloudflare.';
+      } else if (cfOk < cfTotal) {
+        verdict = 'PARTIAL: some Cloudflare-hosted apps were reachable and others were not — consistent with intermittent/partial blocking.';
+      } else {
+        verdict = 'All hosts reachable right now. If the platform failed earlier, the block is intermittent — please run this again at the exact moment it breaks.';
+      }
+      document.getElementById('verdict').textContent = verdict;
+
+      var lines = [
+        'Ted.Talks.DZ connection check',
+        'When: ' + new Date().toString(),
+        'Timezone: ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown'),
+        'Device: ' + navigator.userAgent,
+        ''
+      ];
+      TARGETS.forEach(function (t, i) {
+        var r = results[i];
+        lines.push((r.ok ? '[OK]   ' : '[FAIL] ') + t.label +
+                   ' — ' + (r.ok ? r.ms + 'ms' : (r.timedOut ? 'timed out' : 'failed')) +
+                   (t.cf ? ' (Cloudflare)' : ' (control, not Cloudflare)'));
+      });
+      lines.push('', 'Verdict: ' + verdict);
+      document.getElementById('report').value = lines.join('\n');
+      document.getElementById('summary').classList.add('show');
+    });
+  });
+})();
+</script>
+</body>
+</html>
